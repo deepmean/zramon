@@ -45,14 +45,10 @@ jobs:
         run: |
           cd lede
           TCFG=target/linux/ramips/mt7621/config-5.10
-          echo "--- before ---"
-          grep -nE 'CONFIG_HIGHMEM|CONFIG_SWAP' "$TCFG" || true
-          # router runs CONFIG_HIGHMEM=n (single Normal zone, no HighMem)
+          echo "--- before ---"; grep -nE 'CONFIG_HIGHMEM' "$TCFG" || true
           sed -i 's/^CONFIG_HIGHMEM=y/# CONFIG_HIGHMEM is not set/' "$TCFG"
-          echo "--- after ---"
-          grep -nE 'CONFIG_HIGHMEM|CONFIG_SWAP' "$TCFG" || true
-          # safety: make sure generic also has it off
           sed -i 's/^CONFIG_HIGHMEM=y/# CONFIG_HIGHMEM is not set/' target/linux/generic/config-5.10 || true
+          echo "--- after ---"; grep -nE 'CONFIG_HIGHMEM' "$TCFG" || true
 
       - name: Configure target + zram package
         run: |
@@ -68,24 +64,34 @@ jobs:
           EOF
 
           make defconfig
+          echo "=== selected ==="; grep -E 'CONFIG_PACKAGE_kmod-zram' .config
 
-          echo "=== kernel HIGHMEM / ZRAM state ==="
-          grep -E 'HIGHMEM' .config | head
-          echo "=== selected package ==="
-          grep -E 'CONFIG_PACKAGE_kmod-zram' .config
+      - name: Build tools + toolchain
+        run: |
+          set -o pipefail
+          cd lede
+          make tools/install -j$(nproc) 2>&1 | tail -30
+          make toolchain/install -j$(nproc) 2>&1 | tail -30
 
-      - name: Verify kernel config really has HIGHMEM off
+      - name: Build kernel (generates Module.symvers)
+        run: |
+          set -o pipefail
+          cd lede
+          make target/linux/compile -j$(nproc) V=s 2>&1 | tail -40
+
+      - name: Verify kernel .config HIGHMEM=off
         run: |
           cd lede
-          make target/linux/prepare V=s 2>&1 | tail -20
-          echo "=== generated kernel .config ==="
-          grep -E '^CONFIG_HIGHMEM|^# CONFIG_HIGHMEM' build_dir/target-*/linux-*/linux-5.10.252/.config || true
-          grep -E 'CONFIG_ZRAM|CONFIG_ZSMALLOC|CONFIG_SWAP' build_dir/target-*/linux-*/linux-5.10.252/.config || true
+          KCFG=$(ls build_dir/target-*/linux-*/linux-5.10.252/.config 2>/dev/null | head -1)
+          echo "kernel config: $KCFG"
+          grep -E '^CONFIG_HIGHMEM|^# CONFIG_HIGHMEM' "$KCFG" || true
+          grep -E 'CONFIG_ZRAM|CONFIG_ZSMALLOC|CONFIG_SWAP' "$KCFG" || true
 
       - name: Build zram modules
         run: |
+          set -o pipefail
           cd lede
-          make package/kernel/linux/compile -j$(nproc) V=s 2>&1 | tail -100
+          make package/kernel/linux/compile -j$(nproc) V=s 2>&1 | tail -60
 
       - name: Collect modules
         run: |
@@ -97,6 +103,8 @@ jobs:
           find build_dir -name 'zram.ko' -exec cp {} ../out/zram.ko \; 2>/dev/null || true
           find build_dir -name 'zsmalloc.ko' -exec cp {} ../out/zsmalloc.ko \; 2>/dev/null || true
           echo "=== out ==="; ls -lR ../out
+          # fail loudly if nothing produced
+          test -f ../out/zram.ko || { echo "::error::zram.ko not produced"; exit 1; }
 
       - name: Report vermagic
         run: |
@@ -111,4 +119,4 @@ jobs:
         with:
           name: kmod-zram-5.10.252-highmem-n
           path: out/
-          if-no-files-found: warn
+          if-no-files-found: error
