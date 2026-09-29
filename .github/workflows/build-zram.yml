@@ -1,0 +1,114 @@
+name: Build kmod-zram (5.10.252, HIGHMEM=n)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  LEDE_REPO: https://github.com/coolsnowwolf/lede
+  LEDE_SHA: 7df5d70268da
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Checkout LEDE at kernel 5.10.252
+        run: |
+          git clone --filter=blob:none "$LEDE_REPO" lede
+          cd lede
+          git checkout "$LEDE_SHA"
+          git log -1 --format='%H %ad %s'
+          grep -E 'LINUX_VERSION-5\.10 =|LINUX_KERNEL_HASH-5\.10\.252' include/kernel-5.10
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential ccache ecj fastjar file g++ gawk \
+            gettext git java-propose-classpath libelf-dev libncurses5-dev \
+            libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+            rsync subversion swig time xsltproc zlib1g-dev unzip wget zstd
+
+      - name: Patch target kernel config -> HIGHMEM=n
+        run: |
+          cd lede
+          TCFG=target/linux/ramips/mt7621/config-5.10
+          echo "--- before ---"
+          grep -nE 'CONFIG_HIGHMEM|CONFIG_SWAP' "$TCFG" || true
+          # router runs CONFIG_HIGHMEM=n (single Normal zone, no HighMem)
+          sed -i 's/^CONFIG_HIGHMEM=y/# CONFIG_HIGHMEM is not set/' "$TCFG"
+          echo "--- after ---"
+          grep -nE 'CONFIG_HIGHMEM|CONFIG_SWAP' "$TCFG" || true
+          # safety: make sure generic also has it off
+          sed -i 's/^CONFIG_HIGHMEM=y/# CONFIG_HIGHMEM is not set/' target/linux/generic/config-5.10 || true
+
+      - name: Configure target + zram package
+        run: |
+          cd lede
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_jcg_q20=y
+          CONFIG_PACKAGE_kmod-zram=m
+          EOF
+
+          make defconfig
+
+          echo "=== kernel HIGHMEM / ZRAM state ==="
+          grep -E 'HIGHMEM' .config | head
+          echo "=== selected package ==="
+          grep -E 'CONFIG_PACKAGE_kmod-zram' .config
+
+      - name: Verify kernel config really has HIGHMEM off
+        run: |
+          cd lede
+          make target/linux/prepare V=s 2>&1 | tail -20
+          echo "=== generated kernel .config ==="
+          grep -E '^CONFIG_HIGHMEM|^# CONFIG_HIGHMEM' build_dir/target-*/linux-*/linux-5.10.252/.config || true
+          grep -E 'CONFIG_ZRAM|CONFIG_ZSMALLOC|CONFIG_SWAP' build_dir/target-*/linux-*/linux-5.10.252/.config || true
+
+      - name: Build zram modules
+        run: |
+          cd lede
+          make package/kernel/linux/compile -j$(nproc) V=s 2>&1 | tail -100
+
+      - name: Collect modules
+        run: |
+          mkdir -p out
+          cd lede
+          find bin -name 'kmod-zram*.ipk' -exec cp {} ../out/ \; 2>/dev/null || true
+          find bin -name 'kmod-lib-lzo*.ipk' -exec cp {} ../out/ \; 2>/dev/null || true
+          find bin -name 'kmod-lib-zstd*.ipk' -exec cp {} ../out/ \; 2>/dev/null || true
+          find build_dir -name 'zram.ko' -exec cp {} ../out/zram.ko \; 2>/dev/null || true
+          find build_dir -name 'zsmalloc.ko' -exec cp {} ../out/zsmalloc.ko \; 2>/dev/null || true
+          echo "=== out ==="; ls -lR ../out
+
+      - name: Report vermagic
+        run: |
+          shopt -s nullglob
+          for f in out/*.ko; do
+            echo "--- $f"
+            strings -a "$f" | grep -E 'vermagic=' | head -2
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmod-zram-5.10.252-highmem-n
+          path: out/
+          if-no-files-found: warn

@@ -1,0 +1,5 @@
+fw/
+probe/
+config.buildinfo
+core_official.gz
+*.ipk
